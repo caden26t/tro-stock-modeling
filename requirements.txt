@@ -1,7 +1,7 @@
 streamlit>=1.32.0
-yfinance>=0.2.37
+yfinance>=0.2.50
 pandas>=2.0.0
 numpy>=1.26.0
-plotly>=5.18.0
+plotly>=5.18.0,<6.0.0
 pandas_ta>=0.3.14b
 scipy>=1.11.0

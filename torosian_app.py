@@ -178,7 +178,7 @@ def ult_osc(h,l,c,s=7,m=14,lg=28):
     return 100*(4*a(s)+2*a(m)+a(lg))/7
 
 def compute_score(hist,sector=""):
-    if hist is None or len(hist)<210: return None,{}
+    if hist is None or len(hist)<100: return None,{}
     c,h,l,v=hist["Close"],hist["High"],hist["Low"],hist["Volume"]
     price=c.iloc[-1]; th=get_thresh(sector)
     signals,raw,mx={},0,0
@@ -214,10 +214,49 @@ def compute_score(hist,sector=""):
 # ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=300,show_spinner=False)
 def get_info(t):
-    try: return yf.Ticker(t).info
-    except: return {}
+    """
+    Robust info fetch — combines yf.fast_info (reliable price/cap data)
+    with yf.info (fundamentals, analyst data, descriptions).
+    Newer yfinance versions moved currentPrice/marketCap out of .info,
+    so we normalise everything into one consistent dict.
+    """
+    result = {}
+    ticker_obj = yf.Ticker(t)
+
+    # ── fast_info: reliable price + market data ──────────
+    try:
+        fi = ticker_obj.fast_info
+        # fast_info uses attribute access, not dict keys
+        result["currentPrice"]    = getattr(fi, "last_price",      None)
+        result["marketCap"]       = getattr(fi, "market_cap",       None)
+        result["sharesOutstanding"]= getattr(fi, "shares",          None)
+        result["fiftyTwoWeekHigh"] = getattr(fi, "year_high",       None)
+        result["fiftyTwoWeekLow"]  = getattr(fi, "year_low",        None)
+        result["currency"]         = getattr(fi, "currency",        None)
+    except Exception:
+        pass
+
+    # ── .info: fundamentals, analyst data, descriptions ──
+    try:
+        info = ticker_obj.info or {}
+        # Only update keys not already set by fast_info (fast_info is more reliable)
+        for k, v in info.items():
+            if k not in result or result[k] is None:
+                result[k] = v
+        # Ensure currentPrice fallback chain
+        if not result.get("currentPrice"):
+            result["currentPrice"] = (info.get("currentPrice")
+                                   or info.get("regularMarketPrice")
+                                   or info.get("previousClose"))
+        # Ensure marketCap fallback
+        if not result.get("marketCap"):
+            result["marketCap"] = info.get("marketCap")
+    except Exception:
+        pass
+
+    return result
 @st.cache_data(ttl=300,show_spinner=False)
-def get_hist(t,period="1y",interval="1d"):
+def get_hist(t,period="2y",interval="1d"):
     try:
         h=yf.Ticker(t).history(period=period,interval=interval)
         return h if len(h)>10 else None
@@ -368,7 +407,7 @@ def model_stage_analysis():
     if hist is None or len(hist) < 45:
         st.error("Not enough weekly data. Try a larger-cap stock."); return
 
-    c = hist["Close"].squeeze()
+    c = pd.Series(hist["Close"].values.flatten(), index=hist.index)
     ma40 = sma(c, 40)
     ma10 = sma(c, 10)
 
@@ -399,15 +438,18 @@ def model_stage_analysis():
     # Chart
     fig = go.Figure()
     # Stage background shading
-    stage_bands = {"Stage 1":(1,"#5bc8c820"),"Stage 2":(2,"#4caf7d20"),
-                   "Stage 3":(3,"#e07b5c20"),"Stage 4":(4,"#e05c5c20")}
+    stage_bands = {"Stage 1":(1,"rgba(91,200,200,0.13)"),"Stage 2":(2,"rgba(76,175,125,0.13)"),
+                   "Stage 3":(3,"rgba(224,123,92,0.13)"),"Stage 4":(4,"rgba(224,92,92,0.13)")}
     fig.add_trace(go.Scatter(x=hist.index,y=c,name="Price (Weekly)",line=dict(color="#c8953a",width=2)))
     fig.add_trace(go.Scatter(x=hist.index,y=ma40,name="40-Week MA",line=dict(color="#e8c97a",width=2,dash="dash")))
     fig.add_trace(go.Scatter(x=hist.index,y=ma10,name="10-Week MA",line=dict(color="#5bc8c8",width=1,dash="dot"),opacity=0.7))
-    # Mark current stage
-    fig.add_hrect(y0=ma40.iloc[-1]*0.97,y1=ma40.iloc[-1]*1.03,
-        fillcolor=stage_color+"20",line_width=0,annotation_text=f"Stage {stage} Zone",
-        annotation_font_color=stage_color,annotation_font_size=10)
+    # Mark current stage — rgba() required, Plotly rejects 8-digit hex
+    def _hex_to_rgba(hx, alpha=0.12):
+        r,g,b = int(hx[1:3],16), int(hx[3:5],16), int(hx[5:7],16)
+        return f"rgba({r},{g},{b},{alpha})"
+    fig.add_hrect(y0=ma40.iloc[-1]*0.97, y1=ma40.iloc[-1]*1.03,
+        fillcolor=_hex_to_rgba(stage_color), line_width=0,
+        annotation=dict(text=f"Stage {stage} Zone", font=dict(color=stage_color, size=10)))
     layout=CHART_LAYOUT.copy()
     layout.update(height=340,margin=dict(l=0,r=0,t=24,b=0),
         yaxis=dict(showgrid=True,gridcolor="#1f2020",color="#6b6e6c",tickformat="$.2f",tickfont=dict(size=10)),
@@ -440,8 +482,8 @@ def model_mansfield_rs():
     if h_stock is None or h_spy is None:
         st.error("Could not load data."); return
 
-    c_s = h_stock["Close"].squeeze()
-    c_m = h_spy["Close"].squeeze()
+    c_s = pd.Series(h_stock["Close"].values.flatten(), index=h_stock.index)
+    c_m = pd.Series(h_spy["Close"].values.flatten(), index=h_spy.index)
     common = c_s.index.intersection(c_m.index)
     c_s, c_m = c_s.loc[common], c_m.loc[common]
 
@@ -505,7 +547,7 @@ def model_mean_reversion():
         hist = get_hist(ticker)
     if hist is None: st.error("Could not load data."); return
 
-    c = hist["Close"].squeeze()
+    c = pd.Series(hist["Close"].values.flatten(), index=hist.index)
 
     # Bollinger Bands
     bb_mid = sma(c, 20)
@@ -539,14 +581,14 @@ def model_mean_reversion():
 
     fig = make_subplots(rows=2,cols=1,shared_xaxes=True,row_heights=[0.65,0.35],vertical_spacing=0.04)
     fig.add_trace(go.Scatter(x=hist.index,y=bb_upper,name="Upper Band",line=dict(color="#e05c5c",width=1,dash="dot"),opacity=0.6),row=1,col=1)
-    fig.add_trace(go.Scatter(x=hist.index,y=bb_lower,name="Lower Band",fill="tonexty",fillcolor="#5bc8c808",line=dict(color="#4caf7d",width=1,dash="dot"),opacity=0.6),row=1,col=1)
+    fig.add_trace(go.Scatter(x=hist.index,y=bb_lower,name="Lower Band",fill="tonexty",fillcolor="rgba(91,200,200,0.03)",line=dict(color="#4caf7d",width=1,dash="dot"),opacity=0.6),row=1,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=bb_mid,name="20-Day SMA",line=dict(color="#6b6e6c",width=1)),row=1,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=c,name="Price",line=dict(color="#c8953a",width=2)),row=1,col=1)
     rsi_colors=["#4caf7d" if v<30 else("#e05c5c" if v>70 else "#5bc8c8") for v in rsi_series.fillna(50)]
     fig.add_trace(go.Scatter(x=hist.index,y=rsi_series,name="RSI 14",line=dict(color="#c8953a",width=1.5)),row=2,col=1)
     fig.add_hline(y=70,line_color="#e05c5c",line_width=1,line_dash="dot",row=2,col=1)
     fig.add_hline(y=30,line_color="#4caf7d",line_width=1,line_dash="dot",row=2,col=1)
-    fig.add_hrect(y0=30,y1=70,fillcolor="#5bc8c808",line_width=0,row=2,col=1)
+    fig.add_hrect(y0=30,y1=70,fillcolor="rgba(91,200,200,0.03)",line_width=0,row=2,col=1)
     fig.update_layout(height=420,margin=dict(l=0,r=0,t=24,b=0),paper_bgcolor="#111210",plot_bgcolor="#111210",
         font=dict(color="#6b6e6c",family="DM Mono"),
         legend=dict(bgcolor="#181917",bordercolor="#2a2c2b",font=dict(size=10,color="#a0a8a4")),
@@ -580,7 +622,7 @@ def model_elliott_wave():
         hist = get_hist(ticker, period="1y")
     if hist is None: st.error("Could not load data."); return
 
-    c = hist["Close"].squeeze().values
+    c = pd.Series(hist["Close"].values.flatten(), index=hist.index).values
     dates = hist.index
 
     # Find peaks and troughs with adaptive order
@@ -658,8 +700,8 @@ def model_elliott_wave():
                 "50%":"#e8c97a","61.8%":"#c8953a","78.6%":"#5bc8c8","100%":"#6b6e6c"}
     for label,level in fib_levels.items():
         fig.add_hline(y=level,line_color=fib_colors.get(label,"#6b6e6c"),line_width=1,line_dash="dot",
-            annotation_text=f" {label} ${level:.2f}",annotation_position="right",
-            annotation_font_color=fib_colors.get(label,"#6b6e6c"),annotation_font_size=9)
+            annotation=dict(text=f" {label} ${level:.2f}", position="right",
+                           font=dict(color=fib_colors.get(label,"#6b6e6c"), size=9)))
 
     layout=CHART_LAYOUT.copy()
     layout.update(height=400,margin=dict(l=0,r=60,t=24,b=0),
@@ -694,10 +736,10 @@ def model_volume_profile():
         hist = get_hist(ticker, period="1y")
     if hist is None: st.error("Could not load data."); return
 
-    c  = hist["Close"].squeeze()
-    h  = hist["High"].squeeze()
-    l  = hist["Low"].squeeze()
-    v  = hist["Volume"].squeeze()
+    c  = pd.Series(hist["Close"].values.flatten(), index=hist.index)
+    h  = pd.Series(hist["High"].values.flatten(), index=hist.index)
+    l  = pd.Series(hist["Low"].values.flatten(), index=hist.index)
+    v  = pd.Series(hist["Volume"].values.flatten(), index=hist.index)
 
     # ── Volume Profile ──
     n_bins  = 40
@@ -758,15 +800,15 @@ def model_volume_profile():
 
     fig.add_trace(go.Scatter(x=hist.index,y=c,name="Price",line=dict(color="#c8953a",width=2)),row=1,col=1)
     fig.add_trace(go.Scatter(x=hist.index,y=vwap,name="Anchored VWAP",line=dict(color="#e8c97a",width=1.5,dash="dash")),row=1,col=1)
-    fig.add_hrect(y0=val_price,y1=vah_price,fillcolor="#5bc8c820",line_width=0,row=1,col=1)
+    fig.add_hrect(y0=val_price,y1=vah_price,fillcolor="rgba(91,200,200,0.13)",line_width=0,row=1,col=1)
     fig.add_hline(y=poc_price,line_color="#c8953a",line_width=2,line_dash="solid",row=1,col=1,
-                  annotation_text=f" POC ${poc_price:.2f}",annotation_position="right",
-                  annotation_font_color="#c8953a",annotation_font_size=9)
+                  annotation=dict(text=f" POC ${poc_price:.2f}", position="right",
+                                 font=dict(color="#c8953a", size=9)))
     fig.add_hline(y=vah_price,line_color="#4caf7d",line_width=1,line_dash="dot",row=1,col=1)
     fig.add_hline(y=val_price,line_color="#e05c5c",line_width=1,line_dash="dot",row=1,col=1)
 
     # Volume histogram bars
-    bar_colors=["#c8953a" if i==poc_idx else("#5bc8c880" if lo_i<=i<=hi_i else "#2a2c2b80") for i in range(n_bins)]
+    bar_colors=["#c8953a" if i==poc_idx else("rgba(91,200,200,0.5)" if lo_i<=i<=hi_i else "rgba(42,44,43,0.5)") for i in range(n_bins)]
     fig.add_trace(go.Bar(x=vol_at_price,y=bin_mid,orientation="h",name="Volume Profile",
                          marker_color=bar_colors,showlegend=False),row=1,col=2)
 
@@ -879,7 +921,8 @@ def model_dcf():
     fig.add_trace(go.Bar(x=["Terminal Value"],y=[disc_term/1e9],name="Terminal Value",marker_color="#c8953a",opacity=0.8))
     fig.add_hline(y=current_price/1e9 if current_price>1e6 else current_price/1e6,
                   line_color="#e8c97a",line_dash="dash",line_width=1.5,
-                  annotation_text=f" Market Price ${current_price:.2f}",annotation_font_color="#e8c97a",annotation_font_size=9)
+                  annotation=dict(text=f" Market Price ${current_price:.2f}",
+                                 font=dict(color="#e8c97a", size=9)))
     layout=CHART_LAYOUT.copy()
     layout.update(height=300,margin=dict(l=0,r=80,t=24,b=0),
         yaxis=dict(showgrid=True,gridcolor="#1f2020",color="#6b6e6c",
@@ -1040,7 +1083,7 @@ def model_canslim():
 
     with col_radar:
         fig = go.Figure(go.Scatterpolar(r=criteria_values,theta=criteria_labels,fill="toself",
-            fillcolor="#c8953a20",line=dict(color="#c8953a",width=2),name=ticker))
+            fillcolor="rgba(200,149,58,0.13)",line=dict(color="#c8953a",width=2),name=ticker))
         fig.update_layout(height=320,margin=dict(l=20,r=20,t=20,b=20),paper_bgcolor="#111210",
             polar=dict(bgcolor="#181917",
                        radialaxis=dict(visible=True,range=[0,100],color="#6b6e6c",gridcolor="#2a2c2b",tickfont=dict(size=8)),
@@ -1222,11 +1265,11 @@ def render_learn():
                 <div style="font-size:10px;letter-spacing:.12em;text-transform:uppercase;color:#6b6e6c;margin-bottom:5px;">How to read it</div>
                 <p style="font-size:12px;color:#a0a8a4;line-height:1.8;margin-bottom:12px;">{ind['how']}</p>
                 <div style="display:flex;gap:10px;margin-bottom:12px;">
-                    <div style="background:#4caf7d11;border:1px solid #4caf7d33;padding:10px 14px;border-radius:3px;flex:1;">
+                    <div style="background:rgba(76,175,125,0.07);border:1px solid rgba(76,175,125,0.2);padding:10px 14px;border-radius:3px;flex:1;">
                         <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#4caf7d;margin-bottom:3px;">Buy signal</div>
                         <div style="font-size:11px;color:#a0a8a4;">{ind['buy']}</div>
                     </div>
-                    <div style="background:#e05c5c11;border:1px solid #e05c5c33;padding:10px 14px;border-radius:3px;flex:1;">
+                    <div style="background:rgba(224,92,92,0.07);border:1px solid rgba(224,92,92,0.2);padding:10px 14px;border-radius:3px;flex:1;">
                         <div style="font-size:9px;letter-spacing:.12em;text-transform:uppercase;color:#e05c5c;margin-bottom:3px;">Sell signal</div>
                         <div style="font-size:11px;color:#a0a8a4;">{ind['sell']}</div>
                     </div>
@@ -1301,9 +1344,17 @@ def render_app():
             results=[]; prog=st.progress(0,text="Fetching live data…")
             for i,(ticker,name,sec,cap_size) in enumerate(candidates):
                 prog.progress((i+1)/len(candidates),text=f"Analysing {ticker}…")
-                info=get_info(ticker); beta=info.get("beta")
-                if beta is None or not(beta_min<=beta<beta_max): continue
-                hist=get_hist(ticker); score,signals=compute_score(hist,sec)
+                info=get_info(ticker)
+                beta = info.get("beta")
+                # If beta is missing, assume market beta of 1.0 so stock isn't silently dropped
+                if beta is None:
+                    beta = 1.0
+                if not (beta_min <= beta < beta_max): continue
+                hist=get_hist(ticker)
+                try:
+                    score,signals=compute_score(hist,sec)
+                except Exception:
+                    score,signals=None,{}
                 if score is None or score<min_score: continue
                 if use_ind_filter and req_indicators:
                     rv=1 if req_direction=="Bullish" else -1
@@ -1318,7 +1369,12 @@ def render_app():
                     "n_analysts":info.get("numberOfAnalystOpinions"),
                     "score":score,"signals":signals,"hist":hist,"info":info})
             prog.empty()
-            if not results: st.error("No stocks passed all filters."); st.stop()
+            if not results:
+                st.error(
+                    f"No stocks passed all filters — {len(candidates)} candidates checked. "
+                    "Try: set Risk Tolerance to 'Medium', Min Score to 0, and Sector to ALL."
+                )
+                st.stop()
 
             if sort_mode=="Single Indicator" and sort_indicator:
                 rev=(sort_dir=="Most Bullish First")
@@ -1339,7 +1395,7 @@ def render_app():
             with c4: metric_card("Sort Mode",sort_note,horizon,"#5bc8c8")
 
             if use_ind_filter and req_indicators:
-                badges=" &nbsp;".join([f'<span style="background:#c8953a22;color:#c8953a;font-size:10px;padding:2px 8px;border-radius:2px;">{i}</span>' for i in req_indicators])
+                badges=" &nbsp;".join([f'<span style="background:rgba(200,149,58,0.13);color:#c8953a;font-size:10px;padding:2px 8px;border-radius:2px;">{i}</span>' for i in req_indicators])
                 st.markdown(f'<div style="margin:10px 0 4px;font-size:11px;color:#6b6e6c;">Filtered: {req_direction} on &nbsp;{badges}</div>',unsafe_allow_html=True)
 
             st.markdown("<br>",unsafe_allow_html=True)
@@ -1387,8 +1443,14 @@ def render_app():
         if dive_run and dive_ticker:
             with st.spinner(f"Loading {dive_ticker}…"):
                 info=get_info(dive_ticker); hist=get_hist(dive_ticker)
-                sec=info.get("sector",""); score,signals=compute_score(hist,sec); th=get_thresh(sec)
-            if not info: st.error(f"Could not find {dive_ticker}."); st.stop()
+                sec=info.get("sector",""); th=get_thresh(sec)
+                try:
+                    score,signals=compute_score(hist,sec)
+                except Exception:
+                    score,signals=None,{}
+            if not info.get("currentPrice") and not info.get("longName") and not info.get("shortName"):
+                st.error(f"Could not find data for \"{dive_ticker}\". Check the ticker symbol and try again.")
+                st.stop()
             name=info.get("longName",dive_ticker); price=info.get("currentPrice") or info.get("regularMarketPrice")
             beta=info.get("beta"); pe=info.get("trailingPE"); div=(info.get("dividendYield") or 0)*100
             mcap=info.get("marketCap"); target=info.get("targetMeanPrice")
@@ -1452,7 +1514,7 @@ def render_app():
             with g1: st.plotly_chart(score_gauge(data[t1]["score"],t1),use_container_width=True,config={"displayModeBar":False})
             with g2: st.plotly_chart(score_gauge(data[t2]["score"],t2),use_container_width=True,config={"displayModeBar":False})
             s1,s2=data[t1]["score"] or 0,data[t2]["score"] or 0; winner=t1 if s1>s2 else t2
-            st.markdown(f"""<div style="background:#181917;border:1px solid #c8953a33;padding:12px 20px;
+            st.markdown(f"""<div style="background:#181917;border:1px solid rgba(200,149,58,0.2);padding:12px 20px;
                 border-radius:3px;margin-bottom:16px;text-align:center;">
                 <span style="font-size:10px;letter-spacing:.15em;text-transform:uppercase;color:#6b6e6c;">Technical Edge → </span>
                 <span style="font-family:'Fraunces',serif;font-size:1rem;color:#c8953a;">{winner}</span>
@@ -1546,21 +1608,35 @@ def render_models():
         st.markdown("<br>",unsafe_allow_html=True)
         model_tab1,model_tab2,model_tab3 = st.tabs([
             "Stage Analysis","Mansfield Relative Strength","Mean Reversion"])
-        with model_tab1: model_stage_analysis()
-        with model_tab2: model_mansfield_rs()
-        with model_tab3: model_mean_reversion()
+        with model_tab1:
+            try: model_stage_analysis()
+            except Exception as e: st.error(f"Stage Analysis error: {type(e).__name__}: {e}")
+        with model_tab2:
+            try: model_mansfield_rs()
+            except Exception as e: st.error(f"Mansfield RS error: {type(e).__name__}: {e}")
+        with model_tab3:
+            try: model_mean_reversion()
+            except Exception as e: st.error(f"Mean Reversion error: {type(e).__name__}: {e}")
 
     with tab_psych:
         st.markdown("<br>",unsafe_allow_html=True)
         model_tab4,model_tab5 = st.tabs(["Elliott Wave + Fibonacci","Volume Profile + VWAP"])
-        with model_tab4: model_elliott_wave()
-        with model_tab5: model_volume_profile()
+        with model_tab4:
+            try: model_elliott_wave()
+            except Exception as e: st.error(f"Elliott Wave error: {type(e).__name__}: {e}")
+        with model_tab5:
+            try: model_volume_profile()
+            except Exception as e: st.error(f"Volume Profile error: {type(e).__name__}: {e}")
 
     with tab_value:
         st.markdown("<br>",unsafe_allow_html=True)
         model_tab6,model_tab7 = st.tabs(["Discounted Cash Flow","CAN SLIM"])
-        with model_tab6: model_dcf()
-        with model_tab7: model_canslim()
+        with model_tab6:
+            try: model_dcf()
+            except Exception as e: st.error(f"DCF error: {type(e).__name__}: {e}")
+        with model_tab7:
+            try: model_canslim()
+            except Exception as e: st.error(f"CAN SLIM error: {type(e).__name__}: {e}")
 
 # ─────────────────────────────────────────────────────────
 #  GLOBAL SIDEBAR  (always renders regardless of page)
