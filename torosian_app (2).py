@@ -178,7 +178,7 @@ def ult_osc(h,l,c,s=7,m=14,lg=28):
     return 100*(4*a(s)+2*a(m)+a(lg))/7
 
 def compute_score(hist,sector=""):
-    if hist is None or len(hist)<210: return None,{}
+    if hist is None or len(hist)<100: return None,{}
     c,h,l,v=hist["Close"],hist["High"],hist["Low"],hist["Volume"]
     price=c.iloc[-1]; th=get_thresh(sector)
     signals,raw,mx={},0,0
@@ -214,10 +214,49 @@ def compute_score(hist,sector=""):
 # ─────────────────────────────────────────────────────────
 @st.cache_data(ttl=300,show_spinner=False)
 def get_info(t):
-    try: return yf.Ticker(t).info
-    except: return {}
+    """
+    Robust info fetch — combines yf.fast_info (reliable price/cap data)
+    with yf.info (fundamentals, analyst data, descriptions).
+    Newer yfinance versions moved currentPrice/marketCap out of .info,
+    so we normalise everything into one consistent dict.
+    """
+    result = {}
+    ticker_obj = yf.Ticker(t)
+
+    # ── fast_info: reliable price + market data ──────────
+    try:
+        fi = ticker_obj.fast_info
+        # fast_info uses attribute access, not dict keys
+        result["currentPrice"]    = getattr(fi, "last_price",      None)
+        result["marketCap"]       = getattr(fi, "market_cap",       None)
+        result["sharesOutstanding"]= getattr(fi, "shares",          None)
+        result["fiftyTwoWeekHigh"] = getattr(fi, "year_high",       None)
+        result["fiftyTwoWeekLow"]  = getattr(fi, "year_low",        None)
+        result["currency"]         = getattr(fi, "currency",        None)
+    except Exception:
+        pass
+
+    # ── .info: fundamentals, analyst data, descriptions ──
+    try:
+        info = ticker_obj.info or {}
+        # Only update keys not already set by fast_info (fast_info is more reliable)
+        for k, v in info.items():
+            if k not in result or result[k] is None:
+                result[k] = v
+        # Ensure currentPrice fallback chain
+        if not result.get("currentPrice"):
+            result["currentPrice"] = (info.get("currentPrice")
+                                   or info.get("regularMarketPrice")
+                                   or info.get("previousClose"))
+        # Ensure marketCap fallback
+        if not result.get("marketCap"):
+            result["marketCap"] = info.get("marketCap")
+    except Exception:
+        pass
+
+    return result
 @st.cache_data(ttl=300,show_spinner=False)
-def get_hist(t,period="1y",interval="1d"):
+def get_hist(t,period="2y",interval="1d"):
     try:
         h=yf.Ticker(t).history(period=period,interval=interval)
         return h if len(h)>10 else None
@@ -1305,8 +1344,12 @@ def render_app():
             results=[]; prog=st.progress(0,text="Fetching live data…")
             for i,(ticker,name,sec,cap_size) in enumerate(candidates):
                 prog.progress((i+1)/len(candidates),text=f"Analysing {ticker}…")
-                info=get_info(ticker); beta=info.get("beta")
-                if beta is None or not(beta_min<=beta<beta_max): continue
+                info=get_info(ticker)
+                beta = info.get("beta")
+                # If beta is missing, assume market beta of 1.0 so stock isn't silently dropped
+                if beta is None:
+                    beta = 1.0
+                if not (beta_min <= beta < beta_max): continue
                 hist=get_hist(ticker); score,signals=compute_score(hist,sec)
                 if score is None or score<min_score: continue
                 if use_ind_filter and req_indicators:
@@ -1322,7 +1365,12 @@ def render_app():
                     "n_analysts":info.get("numberOfAnalystOpinions"),
                     "score":score,"signals":signals,"hist":hist,"info":info})
             prog.empty()
-            if not results: st.error("No stocks passed all filters."); st.stop()
+            if not results:
+                st.error(
+                    f"No stocks passed all filters — {len(candidates)} candidates checked. "
+                    "Try: set Risk Tolerance to 'Medium', Min Score to 0, and Sector to ALL."
+                )
+                st.stop()
 
             if sort_mode=="Single Indicator" and sort_indicator:
                 rev=(sort_dir=="Most Bullish First")
@@ -1392,7 +1440,9 @@ def render_app():
             with st.spinner(f"Loading {dive_ticker}…"):
                 info=get_info(dive_ticker); hist=get_hist(dive_ticker)
                 sec=info.get("sector",""); score,signals=compute_score(hist,sec); th=get_thresh(sec)
-            if not info: st.error(f"Could not find {dive_ticker}."); st.stop()
+            if not info.get("currentPrice") and not info.get("longName") and not info.get("shortName"):
+                st.error(f"Could not find data for \"{dive_ticker}\". Check the ticker symbol and try again.")
+                st.stop()
             name=info.get("longName",dive_ticker); price=info.get("currentPrice") or info.get("regularMarketPrice")
             beta=info.get("beta"); pe=info.get("trailingPE"); div=(info.get("dividendYield") or 0)*100
             mcap=info.get("marketCap"); target=info.get("targetMeanPrice")
